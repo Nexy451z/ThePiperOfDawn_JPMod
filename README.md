@@ -64,7 +64,8 @@ mod_src/
 
 ## ビルド方法（DLLの再ビルド）
 
-`mod_src/build.bat` をMSVC（x86 Native Tools プロンプト）で実行してください。
+Visual Studio（「C++によるデスクトップ開発」または Build Tools）をインストール後、`mod_src/build.bat` をダブルクリック／実行してください。
+`vswhere` でVSのエディション・バージョンを自動検出してビルドします（`..\dist\version.dll` を出力）。
 出力された `version.dll` をゲームフォルダへ配置します。
 
 ## 翻訳について
