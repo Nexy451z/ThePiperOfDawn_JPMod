@@ -162,8 +162,11 @@ static std::wstring g_modDir;
 static SRWLOCK g_lock = SRWLOCK_INIT;
 static std::atomic<bool> g_modEnabled{ true };
 
+static SRWLOCK g_logLock = SRWLOCK_INIT;
+
 static void LogMsg(const char* fmt, ...) {
     if (g_modDir.empty()) return;
+    AcquireSRWLockExclusive(&g_logLock);
     std::wstring logPath = g_modDir + L"\\mod.log";
     WIN32_FILE_ATTRIBUTE_DATA fad;
     if (GetFileAttributesExW(logPath.c_str(), GetFileExInfoStandard, &fad) &&
@@ -172,7 +175,10 @@ static void LogMsg(const char* fmt, ...) {
         MoveFileExW(logPath.c_str(), oldPath.c_str(), MOVEFILE_REPLACE_EXISTING);
     }
     FILE* fp = _wfopen(logPath.c_str(), L"a");
-    if (!fp) return;
+    if (!fp) {
+        ReleaseSRWLockExclusive(&g_logLock);
+        return;
+    }
     SYSTEMTIME st;
     GetLocalTime(&st);
     fprintf(fp, "[%04d-%02d-%02d %02d:%02d:%02d.%03d] ",
@@ -183,6 +189,7 @@ static void LogMsg(const char* fmt, ...) {
     va_end(args);
     fprintf(fp, "\n");
     fclose(fp);
+    ReleaseSRWLockExclusive(&g_logLock);
 }
 
 // ============================================================================
@@ -258,12 +265,25 @@ static bool ParseJsonString(const char*& p, const char* end, std::string& out) {
                 case 't': out.push_back('\t'); break;
                 case 'u': {
                     uint32_t cp = ParseHex4(p, end);
-                    if (cp >= 0xD800 && cp <= 0xDBFF && p + 2 <= end && p[0] == '\\' && p[1] == 'u') {
-                        p += 2;
-                        uint32_t low = ParseHex4(p, end);
-                        if (low >= 0xDC00 && low <= 0xDFFF) {
-                            cp = 0x10000 + (((cp - 0xD800) << 10) | (low - 0xDC00));
+                    if (cp >= 0xD800 && cp <= 0xDBFF) {
+                        // High surrogate: combine only with a valid low surrogate,
+                        // otherwise emit U+FFFD (a lone surrogate would produce
+                        // invalid UTF-8 that can crash text decoders).
+                        if (p + 2 <= end && p[0] == '\\' && p[1] == 'u') {
+                            const char* save = p;
+                            p += 2;
+                            uint32_t low = ParseHex4(p, end);
+                            if (low >= 0xDC00 && low <= 0xDFFF) {
+                                cp = 0x10000 + (((cp - 0xD800) << 10) | (low - 0xDC00));
+                            } else {
+                                p = save;      // rewind; the escape stands alone
+                                cp = 0xFFFD;
+                            }
+                        } else {
+                            cp = 0xFFFD;
                         }
+                    } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
+                        cp = 0xFFFD;           // lone low surrogate
                     }
                     AppendUtf8(out, cp);
                     break;
@@ -334,9 +354,9 @@ static size_t LoadJsonFileIntoMap(const std::wstring& path, std::unordered_map<i
     if (okOut) *okOut = false;
     FILE* fp = _wfopen(path.c_str(), L"rb");
     if (!fp) return 0;
-    fseek(fp, 0, SEEK_END);
-    long sz = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
+    _fseeki64(fp, 0, SEEK_END);
+    long long sz = _ftelli64(fp);
+    _fseeki64(fp, 0, SEEK_SET);
     if (sz <= 0) { fclose(fp); return 0; }
     if ((uint64_t)sz > (256ull << 20)) {
         fclose(fp);
@@ -512,6 +532,7 @@ using bs_lookup_t = void* (*)(int32_t id, const void* method);
 using get_setting_mgr_t = uintptr_t (*)(const void* method);
 using gchandle_new_t = uint32_t (*)(void* obj, bool pinned);
 using gchandle_free_t = void (*)(uint32_t handle);
+using gchandle_get_target_t = void* (*)(uint32_t handle);
 
 static il2cpp_string_new_t g_il2cpp_string_new = nullptr;
 static bs_lookup_t g_orig_bs_eug = nullptr;
@@ -519,6 +540,7 @@ static bs_lookup_t g_orig_bs_euh = nullptr;
 static get_setting_mgr_t g_get_setting_mgr = nullptr;
 static gchandle_new_t g_gchandle_new = nullptr;
 static gchandle_free_t g_gchandle_free = nullptr;
+static gchandle_get_target_t g_gchandle_get_target = nullptr;
 static std::atomic<bool> g_strCacheAvailable{ false };
 
 // Check if in-game language is set to Japanese (1)
@@ -528,11 +550,12 @@ static std::atomic<int> g_langCheckResult{ 1 };
 
 static bool IsGameLanguageJapanese() {
     if (!g_get_setting_mgr) return true;
-    // The result only changes when the player edits settings, so cache it briefly
-    // instead of calling into the game on every string lookup.
+    // Cache only a positive result. At startup the setting may briefly read as
+    // non-Japanese, so a negative result must never be cached (otherwise the
+    // first UI text would keep the original language).
     int64_t now = (int64_t)GetTickCount64();
-    if (now - g_langCheckTick.load() < 500) {
-        return g_langCheckResult.load() != 0;
+    if (g_langCheckResult.load() && now - g_langCheckTick.load() < 250) {
+        return true;
     }
     bool jp = true;
     __try {
@@ -542,8 +565,13 @@ static bool IsGameLanguageJapanese() {
     __except (EXCEPTION_EXECUTE_HANDLER) {
         jp = true; // fail open: keep translation visible
     }
-    g_langCheckResult.store(jp ? 1 : 0);
-    g_langCheckTick.store(now);
+    if (jp) {
+        g_langCheckResult.store(1);
+        g_langCheckTick.store(now);
+    } else {
+        g_langCheckResult.store(0);
+        g_langCheckTick.store(0);
+    }
     return jp;
 }
 
@@ -560,7 +588,10 @@ static void* CreateLocalizedString(bool isTalk, int32_t id, const std::string& j
     AcquireSRWLockShared(&g_strCacheLock);
     auto it = cache.find(id);
     if (it != cache.end()) {
-        void* obj = it->second.obj;
+        // Prefer re-resolving through the GC handle so the cache stays valid
+        // even if the collector ever moves the object.
+        void* obj = g_gchandle_get_target ? g_gchandle_get_target(it->second.handle) : nullptr;
+        if (!obj) obj = it->second.obj;
         ReleaseSRWLockShared(&g_strCacheLock);
         return obj;
     }
@@ -572,7 +603,9 @@ static void* CreateLocalizedString(bool isTalk, int32_t id, const std::string& j
 
     void* obj = g_il2cpp_string_new(jp.c_str());
     if (!obj) return nullptr;
-    uint32_t handle = g_gchandle_new(obj, true);
+    // Pin only when we cannot re-resolve the object later (avoids heap
+    // fragmentation on collectors that would otherwise move objects).
+    uint32_t handle = g_gchandle_new(obj, g_gchandle_get_target == nullptr);
     if (!handle) return obj;
 
     AcquireSRWLockExclusive(&g_strCacheLock);
@@ -685,35 +718,6 @@ static size_t GetImageSize(uintptr_t base) {
     if (!IsReadableRange(nt, sizeof(IMAGE_NT_HEADERS64))) return 0;
     if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
     return nt->OptionalHeader.SizeOfImage;
-}
-
-static void SuspendOtherThreads(std::vector<HANDLE>& suspended) {
-    DWORD pid = GetCurrentProcessId();
-    DWORD selfTid = GetCurrentThreadId();
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-    if (snap == INVALID_HANDLE_VALUE) return;
-    THREADENTRY32 te;
-    te.dwSize = sizeof(te);
-    if (Thread32First(snap, &te)) {
-        do {
-            if (te.th32OwnerProcessID == pid && te.th32ThreadID != selfTid) {
-                HANDLE h = OpenThread(THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID);
-                if (h) {
-                    if (SuspendThread(h) != (DWORD)-1) suspended.push_back(h);
-                    else CloseHandle(h);
-                }
-            }
-        } while (Thread32Next(snap, &te));
-    }
-    CloseHandle(snap);
-}
-
-static void ResumeOtherThreads(std::vector<HANDLE>& suspended) {
-    for (HANDLE h : suspended) {
-        ResumeThread(h);
-        CloseHandle(h);
-    }
-    suspended.clear();
 }
 
 static void FindPatternAll(uintptr_t base, const uint8_t* pat, size_t patLen,
@@ -863,30 +867,75 @@ static bool InstallHooks(uintptr_t base) {
     memcpy(origEug8, pEug, 8);
     memcpy(origEuh8, pEuh, 8);
 
+    // Validate the rel32 displacement before writing (an out-of-range value is
+    // only reachable if AllocateNearModule ever returned an unexpected address,
+    // but the check guarantees we never write a bogus jump).
+    int64_t deltaEug = (int64_t)((intptr_t)relayEug - ((intptr_t)pEug + 5));
+    int64_t deltaEuh = (int64_t)((intptr_t)relayEuh - ((intptr_t)pEuh + 5));
+    if (deltaEug < INT32_MIN || deltaEug > INT32_MAX || deltaEuh < INT32_MIN || deltaEuh > INT32_MAX) {
+        LogMsg("ERROR: relay jump out of rel32 range (eug=%lld, euh=%lld)",
+            (long long)deltaEug, (long long)deltaEuh);
+        return false;
+    }
+
     // Build replacement bytes (eug: E9 rel32; euh: E9 rel32 + NOP).
     uint8_t patchEug[8];
     memcpy(patchEug, origEug8, 8);
-    int32_t relEug = (int32_t)((intptr_t)relayEug - ((intptr_t)pEug + 5));
+    int32_t relEug = (int32_t)deltaEug;
     patchEug[0] = 0xE9;
     memcpy(patchEug + 1, &relEug, 4);
 
     uint8_t patchEuh[8];
     memcpy(patchEuh, origEuh8, 8);
-    int32_t relEuh = (int32_t)((intptr_t)relayEuh - ((intptr_t)pEuh + 5));
+    int32_t relEuh = (int32_t)deltaEuh;
     patchEuh[0] = 0xE9;
     memcpy(patchEuh + 1, &relEuh, 4);
     patchEuh[5] = 0x90;
 
-    // Apply a patch with all other threads suspended, so no thread can be
-    // executing a half-written instruction while the jump is installed.
+    // Install an 8-byte code patch without deadlocking.
+    //  - 8-byte aligned target: a single atomic store, no thread suspension
+    //    (so we can never block on a lock held by a frozen thread).
+    //  - unaligned target (pattern-scan fallback): freeze other threads, but
+    //    collect the handles into a fixed stack buffer *before* suspending and
+    //    perform no heap allocation while frozen.
     auto applyPatch = [](uint8_t* target, const uint8_t* bytes) -> bool {
         DWORD oldProt = 0;
         if (!VirtualProtect(target, 16, PAGE_EXECUTE_READWRITE, &oldProt)) return false;
-        std::vector<HANDLE> suspended;
-        SuspendOtherThreads(suspended);
-        memcpy(target, bytes, 8);
+
+        if (((uintptr_t)target & 7) == 0) {
+            uint64_t v = 0;
+            memcpy(&v, bytes, 8);
+            InterlockedExchange64((volatile LONG64*)target, (LONG64)v);
+        } else {
+            HANDLE threads[1024];
+            size_t count = 0;
+            DWORD pid = GetCurrentProcessId();
+            DWORD selfTid = GetCurrentThreadId();
+            HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+            if (snap != INVALID_HANDLE_VALUE) {
+                THREADENTRY32 te;
+                te.dwSize = sizeof(te);
+                if (Thread32First(snap, &te)) {
+                    do {
+                        if (te.th32OwnerProcessID == pid && te.th32ThreadID != selfTid &&
+                            count < _countof(threads)) {
+                            HANDLE h = OpenThread(THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID);
+                            if (h) threads[count++] = h;
+                        }
+                    } while (Thread32Next(snap, &te));
+                }
+                CloseHandle(snap);
+            }
+            for (size_t i = 0; i < count; ++i) SuspendThread(threads[i]);
+            memcpy(target, bytes, 8);
+            FlushInstructionCache(GetCurrentProcess(), target, 16);
+            for (size_t i = 0; i < count; ++i) {
+                ResumeThread(threads[i]);
+                CloseHandle(threads[i]);
+            }
+        }
+
         FlushInstructionCache(GetCurrentProcess(), target, 16);
-        ResumeOtherThreads(suspended);
         VirtualProtect(target, 16, oldProt, &oldProt);
         return true;
     };
@@ -897,15 +946,7 @@ static bool InstallHooks(uintptr_t base) {
     }
     if (!applyPatch(pEuh, patchEuh)) {
         LogMsg("ERROR: VirtualProtect failed on bs.euh; rolling back bs.eug");
-        DWORD oldProt = 0;
-        if (VirtualProtect(pEug, 16, PAGE_EXECUTE_READWRITE, &oldProt)) {
-            std::vector<HANDLE> suspended;
-            SuspendOtherThreads(suspended);
-            memcpy(pEug, origEug8, 8);
-            FlushInstructionCache(GetCurrentProcess(), pEug, 16);
-            ResumeOtherThreads(suspended);
-            VirtualProtect(pEug, 16, oldProt, &oldProt);
-        }
+        applyPatch(pEug, origEug8);
         return false;
     }
 
@@ -963,8 +1004,13 @@ static DWORD ModWorkerThreadBody() {
 
     g_gchandle_new = (gchandle_new_t)GetProcAddress(hGA, "il2cpp_gchandle_new");
     g_gchandle_free = (gchandle_free_t)GetProcAddress(hGA, "il2cpp_gchandle_free");
+    g_gchandle_get_target = (gchandle_get_target_t)GetProcAddress(hGA, "il2cpp_gchandle_get_target");
     g_strCacheAvailable = (g_gchandle_new != nullptr && g_gchandle_free != nullptr);
-    LogMsg("String cache: %s", g_strCacheAvailable.load() ? "ENABLED" : "unavailable (allocating per lookup)");
+    if (g_strCacheAvailable.load()) {
+        LogMsg("String cache: ENABLED (%s handles)", g_gchandle_get_target ? "unpinned" : "pinned");
+    } else {
+        LogMsg("String cache: unavailable (allocating per lookup)");
+    }
 
     uintptr_t base = (uintptr_t)hGA;
     LogMsg("GameAssembly.dll base=%p, il2cpp_string_new=%p", (void*)base, (void*)g_il2cpp_string_new);
@@ -1003,7 +1049,7 @@ static DWORD ModWorkerThreadBody() {
         prevF5 = curF5;
         prevF6 = curF6;
         prevF7 = curF7;
-        Sleep(100);
+        Sleep(30); // short poll so quick key taps are not missed
     }
     return 0;
 }
