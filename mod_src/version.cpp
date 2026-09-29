@@ -191,6 +191,17 @@ static void LogMsg(const char* fmt, ...) {
 static std::unordered_map<int32_t, std::string> g_langMap;
 static std::unordered_map<int32_t, std::string> g_talkMap;
 
+// Cache of GC-rooted localized strings (avoids allocating on every lookup).
+struct CachedString {
+    void* obj;
+    uint32_t handle;
+};
+static SRWLOCK g_strCacheLock = SRWLOCK_INIT;
+static std::unordered_map<int32_t, CachedString> g_langStrCache;
+static std::unordered_map<int32_t, CachedString> g_talkStrCache;
+static const size_t kStrCacheLimit = 100000;
+static void ClearStringCaches();
+
 static void AppendUtf8(std::string& out, uint32_t cp) {
     if (cp <= 0x7F) {
         out.push_back((char)cp);
@@ -451,6 +462,8 @@ static void ReloadTranslations() {
     g_talkMap.swap(newTalk);
     ReleaseSRWLockExclusive(&g_lock);
 
+    ClearStringCaches();
+
     LogMsg("Loaded translations: Language=%zu (+%zu overrides), LanguageTalk=%zu (+%zu overrides)",
         c1, c1_patch, c2, c2_patch);
 }
@@ -497,25 +510,95 @@ static void DumpRecentIds() {
 using il2cpp_string_new_t = void* (*)(const char* str);
 using bs_lookup_t = void* (*)(int32_t id, const void* method);
 using get_setting_mgr_t = uintptr_t (*)(const void* method);
+using gchandle_new_t = uint32_t (*)(void* obj, bool pinned);
+using gchandle_free_t = void (*)(uint32_t handle);
 
 static il2cpp_string_new_t g_il2cpp_string_new = nullptr;
 static bs_lookup_t g_orig_bs_eug = nullptr;
 static bs_lookup_t g_orig_bs_euh = nullptr;
 static get_setting_mgr_t g_get_setting_mgr = nullptr;
+static gchandle_new_t g_gchandle_new = nullptr;
+static gchandle_free_t g_gchandle_free = nullptr;
+static std::atomic<bool> g_strCacheAvailable{ false };
 
 // Check if in-game language is set to Japanese (1)
 // In bs.eug/bs.euh: call 0x519E20 -> [rax + 0xC0] == 1 for Japanese (0=CN, 1=JP, 2=TW, 3=EN)
+static std::atomic<int64_t> g_langCheckTick{ 0 };
+static std::atomic<int> g_langCheckResult{ 1 };
+
 static bool IsGameLanguageJapanese() {
     if (!g_get_setting_mgr) return true;
+    // The result only changes when the player edits settings, so cache it briefly
+    // instead of calling into the game on every string lookup.
+    int64_t now = (int64_t)GetTickCount64();
+    if (now - g_langCheckTick.load() < 500) {
+        return g_langCheckResult.load() != 0;
+    }
+    bool jp = true;
     __try {
         uintptr_t mgr = g_get_setting_mgr(nullptr);
-        if (!mgr) return true;
-        int32_t lang = *(int32_t*)(mgr + 0xC0);
-        return (lang == 1);
+        if (mgr) jp = (*(int32_t*)(mgr + 0xC0) == 1);
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
-        return true; // fail open: keep translation visible
+        jp = true; // fail open: keep translation visible
     }
+    g_langCheckResult.store(jp ? 1 : 0);
+    g_langCheckTick.store(now);
+    return jp;
+}
+
+// Return a native Il2CppString for the given translation text.
+// When IL2CPP GC-handle APIs are available the result is cached and rooted,
+// so repeated lookups reuse one object instead of allocating every frame.
+static void* CreateLocalizedString(bool isTalk, int32_t id, const std::string& jp) {
+    if (!g_il2cpp_string_new) return nullptr;
+    if (!g_strCacheAvailable.load()) {
+        return g_il2cpp_string_new(jp.c_str());
+    }
+    auto& cache = isTalk ? g_talkStrCache : g_langStrCache;
+
+    AcquireSRWLockShared(&g_strCacheLock);
+    auto it = cache.find(id);
+    if (it != cache.end()) {
+        void* obj = it->second.obj;
+        ReleaseSRWLockShared(&g_strCacheLock);
+        return obj;
+    }
+    bool atLimit = cache.size() >= kStrCacheLimit;
+    ReleaseSRWLockShared(&g_strCacheLock);
+    if (atLimit) {
+        return g_il2cpp_string_new(jp.c_str());
+    }
+
+    void* obj = g_il2cpp_string_new(jp.c_str());
+    if (!obj) return nullptr;
+    uint32_t handle = g_gchandle_new(obj, true);
+    if (!handle) return obj;
+
+    AcquireSRWLockExclusive(&g_strCacheLock);
+    auto it2 = cache.find(id);
+    if (it2 != cache.end()) {
+        void* existing = it2->second.obj;
+        ReleaseSRWLockExclusive(&g_strCacheLock);
+        g_gchandle_free(handle);
+        return existing;
+    }
+    CachedString entry;
+    entry.obj = obj;
+    entry.handle = handle;
+    cache.emplace(id, entry);
+    ReleaseSRWLockExclusive(&g_strCacheLock);
+    return obj;
+}
+
+static void ClearStringCaches() {
+    AcquireSRWLockExclusive(&g_strCacheLock);
+    // Do NOT free the GC handles here: a game thread may still hold a string we
+    // already handed out. Dropping the map is enough to pick up new content on
+    // the next lookup; the few leaked roots are harmless.
+    g_langStrCache.clear();
+    g_talkStrCache.clear();
+    ReleaseSRWLockExclusive(&g_strCacheLock);
 }
 
 static void* Hook_bs_eug(int32_t id, const void* method) {
@@ -529,7 +612,7 @@ static void* Hook_bs_eug(int32_t id, const void* method) {
     AcquireSRWLockShared(&g_lock);
     auto it = g_langMap.find(id);
     if (it != g_langMap.end() && !it->second.empty()) {
-        customRet = g_il2cpp_string_new(it->second.c_str());
+        customRet = CreateLocalizedString(false, id, it->second);
     }
     ReleaseSRWLockShared(&g_lock);
     return customRet ? customRet : origRet;
@@ -546,7 +629,7 @@ static void* Hook_bs_euh(int32_t id, const void* method) {
     AcquireSRWLockShared(&g_lock);
     auto it = g_talkMap.find(id);
     if (it != g_talkMap.end() && !it->second.empty()) {
-        customRet = g_il2cpp_string_new(it->second.c_str());
+        customRet = CreateLocalizedString(true, id, it->second);
     }
     ReleaseSRWLockShared(&g_lock);
     return customRet ? customRet : origRet;
@@ -633,25 +716,26 @@ static void ResumeOtherThreads(std::vector<HANDLE>& suspended) {
     suspended.clear();
 }
 
-static uint8_t* FindPatternInModule(uintptr_t base, const uint8_t* pat, size_t patLen) {
+static void FindPatternAll(uintptr_t base, const uint8_t* pat, size_t patLen,
+                           std::vector<uint8_t*>& out, size_t maxHits = 64) {
+    out.clear();
     auto* dos = (IMAGE_DOS_HEADER*)base;
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return nullptr;
+    if (!IsReadableRange(dos, sizeof(IMAGE_DOS_HEADER)) || dos->e_magic != IMAGE_DOS_SIGNATURE) return;
     auto* nt = (IMAGE_NT_HEADERS64*)(base + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE) return nullptr;
+    if (!IsReadableRange(nt, sizeof(IMAGE_NT_HEADERS64)) || nt->Signature != IMAGE_NT_SIGNATURE) return;
     auto* sec = IMAGE_FIRST_SECTION(nt);
     for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec) {
-        if (sec->Characteristics & IMAGE_SCN_MEM_EXECUTE) {
-            uint8_t* start = (uint8_t*)(base + sec->VirtualAddress);
-            size_t sz = sec->Misc.VirtualSize;
-            if (sz < patLen) continue;
-            for (size_t off = 0; off <= sz - patLen; ++off) {
-                if (memcmp(start + off, pat, patLen) == 0) {
-                    return start + off;
-                }
+        if (!(sec->Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+        uint8_t* start = (uint8_t*)(base + sec->VirtualAddress);
+        size_t sz = sec->Misc.VirtualSize;
+        if (sz < patLen) continue;
+        for (size_t off = 0; off <= sz - patLen; ++off) {
+            if (memcmp(start + off, pat, patLen) == 0) {
+                out.push_back(start + off);
+                if (out.size() >= maxHits) return;
             }
         }
     }
-    return nullptr;
 }
 
 static bool InstallHooks(uintptr_t base) {
@@ -667,51 +751,69 @@ static bool InstallHooks(uintptr_t base) {
         return a >= base && a + n <= base + imgSize && IsReadableRange(p, n);
     };
 
-    uint8_t* pEug = (uint8_t*)(base + 0x3D2D20);
-    uint8_t* pEuh = (uint8_t*)(base + 0x3D2E40);
-
     const uint8_t expectedEug[5] = { 0x48, 0x89, 0x5C, 0x24, 0x08 };
     const uint8_t expectedEuh[6] = { 0x40, 0x53, 0x48, 0x83, 0xEC, 0x20 };
 
-    if (!inImage(pEug, 32) || !inImage(pEuh, 32)) {
-        LogMsg("ERROR: Hook target RVAs are outside the GameAssembly.dll image");
+    // Pattern-scan first so the mod keeps working when a game update shifts code.
+    // The signature is a unique switch tail inside bs.euh, at +0xAB from its entry.
+    const uint8_t euhTailSig[] = {
+        0x8B, 0x90, 0xC0, 0x00, 0x00, 0x00,
+        0x85, 0xD2, 0x74, 0x2D,
+        0x83, 0xEA, 0x01, 0x74, 0x1E,
+        0x83, 0xEA, 0x01, 0x74, 0x0F
+    };
+
+    uint8_t* pEug = nullptr;
+    uint8_t* pEuh = nullptr;
+    bool resolved = false;
+
+    std::vector<uint8_t*> hits;
+    FindPatternAll(base, euhTailSig, sizeof(euhTailSig), hits);
+    std::vector<std::pair<uint8_t*, uint8_t*>> candidates;
+    for (uint8_t* tail : hits) {
+        if ((uintptr_t)tail < base + 0xAB + 0x120) continue;
+        uint8_t* candEuh = tail - 0xAB;
+        uint8_t* candEug = candEuh - 0x120;
+        if (candEug >= candEuh || !inImage(candEug, 32) || !inImage(candEuh, 32)) continue;
+        if (memcmp(candEug, expectedEug, 5) != 0 || memcmp(candEuh, expectedEuh, 6) != 0) continue;
+        if (!(inImage(candEuh + 0xA1, 5) && candEuh[0xA1] == 0xE8)) continue;
+        int32_t rel = *(int32_t*)(candEuh + 0xA2);
+        uintptr_t tgt = (uintptr_t)(candEuh + 0xA6) + (intptr_t)rel;
+        if (tgt < base || tgt >= base + imgSize) continue;
+        candidates.push_back({ candEug, candEuh });
+    }
+
+    if (candidates.size() == 1) {
+        pEug = candidates[0].first;
+        pEuh = candidates[0].second;
+        resolved = true;
+        LogMsg("Pattern scan located hooks (unique): bs.eug RVA 0x%llX, bs.euh RVA 0x%llX",
+            (unsigned long long)((uintptr_t)pEug - base),
+            (unsigned long long)((uintptr_t)pEuh - base));
+    } else if (candidates.size() > 1) {
+        LogMsg("ERROR: Pattern scan found %zu candidate(s); refusing to guess", candidates.size());
         return false;
     }
 
-    if (memcmp(pEug, expectedEug, 5) != 0 || memcmp(pEuh, expectedEuh, 6) != 0) {
-        // Fallback pattern scan for future game updates where RVAs shift:
-        // Unique switch tail in bs.euh at offset +0xAB from pEuh (and pEug is pEuh - 0x120)
-        const uint8_t euhTailSig[] = {
-            0x8B, 0x90, 0xC0, 0x00, 0x00, 0x00,
-            0x85, 0xD2, 0x74, 0x2D,
-            0x83, 0xEA, 0x01, 0x74, 0x1E,
-            0x83, 0xEA, 0x01, 0x74, 0x0F
-        };
-        uint8_t* foundTail = FindPatternInModule(base, euhTailSig, sizeof(euhTailSig));
-        if (!foundTail) {
-            LogMsg("ERROR: Pattern scan failed to locate hook targets");
+    if (!resolved) {
+        // Fall back to the last known RVAs (validated before use).
+        pEug = (uint8_t*)(base + 0x3D2D20);
+        pEuh = (uint8_t*)(base + 0x3D2E40);
+        if (!inImage(pEug, 32) || !inImage(pEuh, 32)) {
+            LogMsg("ERROR: Hook target RVAs are outside the GameAssembly.dll image");
             return false;
         }
-        pEuh = foundTail - 0xAB;
-        pEug = pEuh - 0x120;
-        if (pEug >= pEuh || !inImage(pEug, 32) || !inImage(pEuh, 32)) {
-            LogMsg("ERROR: Pattern scan result is outside the image; aborting");
+        if (memcmp(pEug, expectedEug, 5) != 0) {
+            LogMsg("ERROR: Prologue mismatch at bs.eug: %02X %02X %02X %02X %02X",
+                pEug[0], pEug[1], pEug[2], pEug[3], pEug[4]);
             return false;
         }
-        LogMsg("Pattern scan located bs.eug=%p (RVA 0x%llX), bs.euh=%p (RVA 0x%llX)",
-            pEug, (unsigned long long)((uintptr_t)pEug - base),
-            pEuh, (unsigned long long)((uintptr_t)pEuh - base));
-    }
-
-    if (memcmp(pEug, expectedEug, 5) != 0) {
-        LogMsg("ERROR: Prologue mismatch at bs.eug: %02X %02X %02X %02X %02X",
-            pEug[0], pEug[1], pEug[2], pEug[3], pEug[4]);
-        return false;
-    }
-    if (memcmp(pEuh, expectedEuh, 6) != 0) {
-        LogMsg("ERROR: Prologue mismatch at bs.euh: %02X %02X %02X %02X %02X %02X",
-            pEuh[0], pEuh[1], pEuh[2], pEuh[3], pEuh[4], pEuh[5]);
-        return false;
+        if (memcmp(pEuh, expectedEuh, 6) != 0) {
+            LogMsg("ERROR: Prologue mismatch at bs.euh: %02X %02X %02X %02X %02X %02X",
+                pEuh[0], pEuh[1], pEuh[2], pEuh[3], pEuh[4], pEuh[5]);
+            return false;
+        }
+        LogMsg("Pattern scan inconclusive; using known RVAs");
     }
 
     // Dynamically resolve get_setting_mgr from the call instruction at pEuh + 0xA1
@@ -858,6 +960,11 @@ static DWORD ModWorkerThreadBody() {
         LogMsg("ERROR: Timed out waiting for GameAssembly.dll / il2cpp_string_new");
         return 0;
     }
+
+    g_gchandle_new = (gchandle_new_t)GetProcAddress(hGA, "il2cpp_gchandle_new");
+    g_gchandle_free = (gchandle_free_t)GetProcAddress(hGA, "il2cpp_gchandle_free");
+    g_strCacheAvailable = (g_gchandle_new != nullptr && g_gchandle_free != nullptr);
+    LogMsg("String cache: %s", g_strCacheAvailable.load() ? "ENABLED" : "unavailable (allocating per lookup)");
 
     uintptr_t base = (uintptr_t)hGA;
     LogMsg("GameAssembly.dll base=%p, il2cpp_string_new=%p", (void*)base, (void*)g_il2cpp_string_new);
