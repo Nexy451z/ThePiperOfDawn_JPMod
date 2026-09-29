@@ -1,11 +1,14 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <tlhelp32.h>
 #include <mmsystem.h>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <atomic>
+#include <exception>
 #include <unordered_map>
 #include <vector>
 #include <fstream>
@@ -13,19 +16,22 @@
 
 #pragma comment(lib, "user32.lib")
 
+#if !defined(_WIN64)
+#error "version.cpp is x64-only (inline hooks use 64-bit absolute jumps)."
+#endif
+
 // ============================================================================
 // 1. System version.dll Proxy Forwarding
 // ============================================================================
 static HMODULE g_hSysVersion = nullptr;
 static FARPROC g_pfnVersion[17] = { nullptr };
 
-static void InitVersionProxy() {
-    if (g_hSysVersion) return;
+static BOOL CALLBACK InitVersionProxyOnce(PINIT_ONCE, PVOID, PVOID*) {
     wchar_t sysDir[MAX_PATH] = { 0 };
     GetSystemDirectoryW(sysDir, MAX_PATH);
     std::wstring path = std::wstring(sysDir) + L"\\version.dll";
-    g_hSysVersion = LoadLibraryW(path.c_str());
-    if (!g_hSysVersion) return;
+    HMODULE h = LoadLibraryW(path.c_str());
+    if (!h) return FALSE;
 
     const char* names[17] = {
         "GetFileVersionInfoA",
@@ -46,9 +52,19 @@ static void InitVersionProxy() {
         "VerQueryValueA",
         "VerQueryValueW"
     };
+    FARPROC fns[17] = { nullptr };
     for (int i = 0; i < 17; ++i) {
-        g_pfnVersion[i] = GetProcAddress(g_hSysVersion, names[i]);
+        fns[i] = GetProcAddress(h, names[i]);
     }
+    // Publish only after every slot is filled (no partial-state race).
+    for (int i = 0; i < 17; ++i) g_pfnVersion[i] = fns[i];
+    g_hSysVersion = h;
+    return TRUE;
+}
+
+static void InitVersionProxy() {
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+    InitOnceExecuteOnce(&once, InitVersionProxyOnce, nullptr, nullptr);
 }
 
 extern "C" {
@@ -144,11 +160,17 @@ BOOL WINAPI Proxy_VerQueryValueW(LPCVOID a, LPCWSTR b, LPVOID* c, PUINT d) {
 // ============================================================================
 static std::wstring g_modDir;
 static SRWLOCK g_lock = SRWLOCK_INIT;
-static bool g_modEnabled = true;
+static std::atomic<bool> g_modEnabled{ true };
 
 static void LogMsg(const char* fmt, ...) {
     if (g_modDir.empty()) return;
     std::wstring logPath = g_modDir + L"\\mod.log";
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    if (GetFileAttributesExW(logPath.c_str(), GetFileExInfoStandard, &fad) &&
+        (((uint64_t)fad.nFileSizeHigh << 32) | fad.nFileSizeLow) > (1ull << 20)) {
+        std::wstring oldPath = logPath + L".old";
+        MoveFileExW(logPath.c_str(), oldPath.c_str(), MOVEFILE_REPLACE_EXISTING);
+    }
     FILE* fp = _wfopen(logPath.c_str(), L"a");
     if (!fp) return;
     SYSTEMTIME st;
@@ -250,18 +272,26 @@ static bool ParseJsonInt(const char*& p, const char* end, int32_t& out) {
     bool neg = false;
     if (*p == '-') { neg = true; ++p; }
     if (p >= end || *p < '0' || *p > '9') return false;
-    int64_t val = 0;
+    uint64_t val = 0;
+    bool overflow = false;
     while (p < end && *p >= '0' && *p <= '9') {
-        val = val * 10 + (*p - '0');
+        if (val > 0x7FFFFFFFull) {
+            overflow = true; // keep consuming digits, discard value
+        } else {
+            val = val * 10 + (uint64_t)(*p - '0');
+            if (val > 0x7FFFFFFFull) overflow = true;
+        }
         ++p;
     }
-    out = (int32_t)(neg ? -val : val);
+    if (overflow) return false;
+    out = neg ? -(int32_t)val : (int32_t)val;
     return true;
 }
 
 static void SkipJsonValue(const char*& p, const char* end) {
     SkipWs(p, end);
     if (p >= end) return;
+    const char* start = p;
     if (*p == '"') {
         std::string dummy;
         ParseJsonString(p, end, dummy);
@@ -284,19 +314,39 @@ static void SkipJsonValue(const char*& p, const char* end) {
             ++p;
         }
     }
+    // Malformed input (e.g. a stray '}' in an array) must still make progress,
+    // otherwise the parser loop would spin forever.
+    if (p == start && p < end) ++p;
 }
 
-static size_t LoadJsonFileIntoMap(const std::wstring& path, std::unordered_map<int32_t, std::string>& targetMap) {
+static size_t LoadJsonFileIntoMap(const std::wstring& path, std::unordered_map<int32_t, std::string>& targetMap, bool* okOut = nullptr) {
+    if (okOut) *okOut = false;
     FILE* fp = _wfopen(path.c_str(), L"rb");
     if (!fp) return 0;
     fseek(fp, 0, SEEK_END);
     long sz = ftell(fp);
     fseek(fp, 0, SEEK_SET);
     if (sz <= 0) { fclose(fp); return 0; }
+    if ((uint64_t)sz > (256ull << 20)) {
+        fclose(fp);
+        LogMsg("ERROR: JSON file exceeds 256MB limit; ignored");
+        return 0;
+    }
 
-    std::string buf((size_t)sz, '\0');
-    fread(&buf[0], 1, (size_t)sz, fp);
+    std::string buf;
+    try {
+        buf.resize((size_t)sz);
+    } catch (const std::exception&) {
+        fclose(fp);
+        LogMsg("ERROR: Out of memory while loading JSON");
+        return 0;
+    }
+    size_t got = fread(&buf[0], 1, (size_t)sz, fp);
     fclose(fp);
+    if (got != (size_t)sz) {
+        LogMsg("ERROR: Short read while loading JSON");
+        return 0;
+    }
 
     const char* p = buf.data();
     const char* end = p + buf.size();
@@ -361,8 +411,11 @@ static size_t LoadJsonFileIntoMap(const std::wstring& path, std::unordered_map<i
             SkipWs(p, end);
             std::string val;
             if (ParseJsonString(p, end, val)) {
-                int32_t id = (int32_t)atoi(key.c_str());
-                if (id != 0 || key == "0") {
+                const char* kp = key.c_str();
+                const char* kend = kp + key.size();
+                int32_t id = 0;
+                bool parsed = ParseJsonInt(kp, kend, id);
+                if (parsed && (id != 0 || key == "0")) {
                     targetMap[id] = std::move(val);
                     ++count;
                 }
@@ -371,6 +424,7 @@ static size_t LoadJsonFileIntoMap(const std::wstring& path, std::unordered_map<i
             }
         }
     }
+    if (okOut) *okOut = true;
     return count;
 }
 
@@ -380,10 +434,17 @@ static void ReloadTranslations() {
     newLang.reserve(8192);
     newTalk.reserve(45000);
 
-    size_t c1 = LoadJsonFileIntoMap(g_modDir + L"\\Language.json", newLang);
+    bool okLang = false;
+    bool okTalk = false;
+    size_t c1 = LoadJsonFileIntoMap(g_modDir + L"\\Language.json", newLang, &okLang);
     size_t c1_patch = LoadJsonFileIntoMap(g_modDir + L"\\override_Language.json", newLang);
-    size_t c2 = LoadJsonFileIntoMap(g_modDir + L"\\LanguageTalk.json", newTalk);
+    size_t c2 = LoadJsonFileIntoMap(g_modDir + L"\\LanguageTalk.json", newTalk, &okTalk);
     size_t c2_patch = LoadJsonFileIntoMap(g_modDir + L"\\override_LanguageTalk.json", newTalk);
+
+    if (!okLang || !okTalk) {
+        LogMsg("ERROR: Reload aborted (Language.json or LanguageTalk.json missing/unreadable); keeping previous translations");
+        return;
+    }
 
     AcquireSRWLockExclusive(&g_lock);
     g_langMap.swap(newLang);
@@ -397,17 +458,14 @@ static void ReloadTranslations() {
 // ============================================================================
 // 4. Recent Lookup Ring Buffer (for F7 Debug Dump)
 // ============================================================================
-struct RecentEntry {
-    bool isTalk;
-    int32_t id;
-};
-static RecentEntry g_recentRing[128];
+// Packed entry: bit0 = isTalk, bits1..32 = id. Written/read atomically.
+static volatile LONG64 g_recentRing[128] = { 0 };
 static volatile LONG g_recentIdx = 0;
 
 static void RecordRecent(bool isTalk, int32_t id) {
     LONG idx = InterlockedIncrement(&g_recentIdx) & 127;
-    g_recentRing[idx].isTalk = isTalk;
-    g_recentRing[idx].id = id;
+    LONG64 v = ((LONG64)(uint32_t)id << 1) | (isTalk ? 1 : 0);
+    InterlockedExchange64(&g_recentRing[idx], v);
 }
 
 static void DumpRecentIds() {
@@ -418,13 +476,15 @@ static void DumpRecentIds() {
     LONG cur = g_recentIdx;
     AcquireSRWLockShared(&g_lock);
     for (int i = 127; i >= 0; --i) {
-        const auto& e = g_recentRing[(cur - i) & 127];
-        if (e.id == 0) continue;
-        const char* table = e.isTalk ? "LanguageTalk" : "Language";
-        const auto& mp = e.isTalk ? g_talkMap : g_langMap;
-        auto it = mp.find(e.id);
+        LONG64 v = g_recentRing[(cur - i) & 127];
+        int32_t id = (int32_t)(v >> 1);
+        bool isTalk = (v & 1) != 0;
+        if (id == 0) continue;
+        const char* table = isTalk ? "LanguageTalk" : "Language";
+        const auto& mp = isTalk ? g_talkMap : g_langMap;
+        auto it = mp.find(id);
         const char* txt = (it != mp.end()) ? it->second.c_str() : "<not in mod json>";
-        fprintf(fp, "[%s] ID=%d : %s\n", table, e.id, txt);
+        fprintf(fp, "[%s] ID=%d : %s\n", table, id, txt);
     }
     ReleaseSRWLockShared(&g_lock);
     fclose(fp);
@@ -447,17 +507,22 @@ static get_setting_mgr_t g_get_setting_mgr = nullptr;
 // In bs.eug/bs.euh: call 0x519E20 -> [rax + 0xC0] == 1 for Japanese (0=CN, 1=JP, 2=TW, 3=EN)
 static bool IsGameLanguageJapanese() {
     if (!g_get_setting_mgr) return true;
-    uintptr_t mgr = g_get_setting_mgr(nullptr);
-    if (!mgr) return true;
-    int32_t lang = *(int32_t*)(mgr + 0xC0);
-    return (lang == 1);
+    __try {
+        uintptr_t mgr = g_get_setting_mgr(nullptr);
+        if (!mgr) return true;
+        int32_t lang = *(int32_t*)(mgr + 0xC0);
+        return (lang == 1);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return true; // fail open: keep translation visible
+    }
 }
 
 static void* Hook_bs_eug(int32_t id, const void* method) {
     void* origRet = g_orig_bs_eug(id, method);
     if (!origRet) return origRet;
     RecordRecent(false, id);
-    if (!g_modEnabled || !g_il2cpp_string_new || !IsGameLanguageJapanese()) {
+    if (!g_modEnabled.load() || !g_il2cpp_string_new || !IsGameLanguageJapanese()) {
         return origRet;
     }
     void* customRet = nullptr;
@@ -474,7 +539,7 @@ static void* Hook_bs_euh(int32_t id, const void* method) {
     void* origRet = g_orig_bs_euh(id, method);
     if (!origRet) return origRet;
     RecordRecent(true, id);
-    if (!g_modEnabled || !g_il2cpp_string_new || !IsGameLanguageJapanese()) {
+    if (!g_modEnabled.load() || !g_il2cpp_string_new || !IsGameLanguageJapanese()) {
         return origRet;
     }
     void* customRet = nullptr;
@@ -516,6 +581,58 @@ static void WriteAbsJump64(uint8_t* dst, uintptr_t target) {
     *(uint64_t*)(dst + 6) = (uint64_t)target;
 }
 
+static bool IsReadableRange(const void* addr, size_t size) {
+    uintptr_t a = (uintptr_t)addr;
+    uintptr_t end = a + size;
+    if (end < a) return false;
+    MEMORY_BASIC_INFORMATION mbi;
+    while (a < end) {
+        if (!VirtualQuery((LPCVOID)a, &mbi, sizeof(mbi))) return false;
+        if (mbi.State != MEM_COMMIT) return false;
+        if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return false;
+        a = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+    }
+    return true;
+}
+
+static size_t GetImageSize(uintptr_t base) {
+    auto* dos = (IMAGE_DOS_HEADER*)base;
+    if (!IsReadableRange(dos, sizeof(IMAGE_DOS_HEADER)) || dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+    auto* nt = (IMAGE_NT_HEADERS64*)(base + dos->e_lfanew);
+    if (!IsReadableRange(nt, sizeof(IMAGE_NT_HEADERS64))) return 0;
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
+    return nt->OptionalHeader.SizeOfImage;
+}
+
+static void SuspendOtherThreads(std::vector<HANDLE>& suspended) {
+    DWORD pid = GetCurrentProcessId();
+    DWORD selfTid = GetCurrentThreadId();
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return;
+    THREADENTRY32 te;
+    te.dwSize = sizeof(te);
+    if (Thread32First(snap, &te)) {
+        do {
+            if (te.th32OwnerProcessID == pid && te.th32ThreadID != selfTid) {
+                HANDLE h = OpenThread(THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID);
+                if (h) {
+                    if (SuspendThread(h) != (DWORD)-1) suspended.push_back(h);
+                    else CloseHandle(h);
+                }
+            }
+        } while (Thread32Next(snap, &te));
+    }
+    CloseHandle(snap);
+}
+
+static void ResumeOtherThreads(std::vector<HANDLE>& suspended) {
+    for (HANDLE h : suspended) {
+        ResumeThread(h);
+        CloseHandle(h);
+    }
+    suspended.clear();
+}
+
 static uint8_t* FindPatternInModule(uintptr_t base, const uint8_t* pat, size_t patLen) {
     auto* dos = (IMAGE_DOS_HEADER*)base;
     if (dos->e_magic != IMAGE_DOS_SIGNATURE) return nullptr;
@@ -540,11 +657,26 @@ static uint8_t* FindPatternInModule(uintptr_t base, const uint8_t* pat, size_t p
 static bool InstallHooks(uintptr_t base) {
     // RVA 0x3D2D20: bs.eug (first 5 bytes: 48 89 5C 24 08 = mov [rsp+8], rbx)
     // RVA 0x3D2E40: bs.euh (first 6 bytes: 40 53 48 83 EC 20 = push rbx; sub rsp, 20h)
+    size_t imgSize = GetImageSize(base);
+    if (imgSize == 0) {
+        LogMsg("ERROR: Failed to read GameAssembly.dll PE headers");
+        return false;
+    }
+    auto inImage = [base, imgSize](const uint8_t* p, size_t n) -> bool {
+        uintptr_t a = (uintptr_t)p;
+        return a >= base && a + n <= base + imgSize && IsReadableRange(p, n);
+    };
+
     uint8_t* pEug = (uint8_t*)(base + 0x3D2D20);
     uint8_t* pEuh = (uint8_t*)(base + 0x3D2E40);
 
     const uint8_t expectedEug[5] = { 0x48, 0x89, 0x5C, 0x24, 0x08 };
     const uint8_t expectedEuh[6] = { 0x40, 0x53, 0x48, 0x83, 0xEC, 0x20 };
+
+    if (!inImage(pEug, 32) || !inImage(pEuh, 32)) {
+        LogMsg("ERROR: Hook target RVAs are outside the GameAssembly.dll image");
+        return false;
+    }
 
     if (memcmp(pEug, expectedEug, 5) != 0 || memcmp(pEuh, expectedEuh, 6) != 0) {
         // Fallback pattern scan for future game updates where RVAs shift:
@@ -556,13 +688,19 @@ static bool InstallHooks(uintptr_t base) {
             0x83, 0xEA, 0x01, 0x74, 0x0F
         };
         uint8_t* foundTail = FindPatternInModule(base, euhTailSig, sizeof(euhTailSig));
-        if (foundTail) {
-            pEuh = foundTail - 0xAB;
-            pEug = pEuh - 0x120;
-            LogMsg("Pattern scan located bs.eug=%p (RVA 0x%llX), bs.euh=%p (RVA 0x%llX)",
-                pEug, (unsigned long long)((uintptr_t)pEug - base),
-                pEuh, (unsigned long long)((uintptr_t)pEuh - base));
+        if (!foundTail) {
+            LogMsg("ERROR: Pattern scan failed to locate hook targets");
+            return false;
         }
+        pEuh = foundTail - 0xAB;
+        pEug = pEuh - 0x120;
+        if (pEug >= pEuh || !inImage(pEug, 32) || !inImage(pEuh, 32)) {
+            LogMsg("ERROR: Pattern scan result is outside the image; aborting");
+            return false;
+        }
+        LogMsg("Pattern scan located bs.eug=%p (RVA 0x%llX), bs.euh=%p (RVA 0x%llX)",
+            pEug, (unsigned long long)((uintptr_t)pEug - base),
+            pEuh, (unsigned long long)((uintptr_t)pEuh - base));
     }
 
     if (memcmp(pEug, expectedEug, 5) != 0) {
@@ -577,12 +715,18 @@ static bool InstallHooks(uintptr_t base) {
     }
 
     // Dynamically resolve get_setting_mgr from the call instruction at pEuh + 0xA1
-    if (pEuh[0xA1] == 0xE8) {
+    if (inImage(pEuh + 0xA1, 5) && pEuh[0xA1] == 0xE8) {
         int32_t relCall = *(int32_t*)(pEuh + 0xA2);
         uintptr_t targetAddr = (uintptr_t)(pEuh + 0xA6) + (intptr_t)relCall;
-        g_get_setting_mgr = (get_setting_mgr_t)targetAddr;
-        LogMsg("Resolved get_setting_mgr=%p (RVA 0x%llX)",
-            (void*)targetAddr, (unsigned long long)(targetAddr - base));
+        if (targetAddr >= base && targetAddr < base + imgSize && IsReadableRange((void*)targetAddr, 1)) {
+            g_get_setting_mgr = (get_setting_mgr_t)targetAddr;
+            LogMsg("Resolved get_setting_mgr=%p (RVA 0x%llX)",
+                (void*)targetAddr, (unsigned long long)(targetAddr - base));
+        } else {
+            LogMsg("WARN: get_setting_mgr target is outside the image; language detection disabled");
+        }
+    } else {
+        LogMsg("WARN: get_setting_mgr call site not found; language detection disabled");
     }
 
     uint8_t* stubPage = AllocateNearModule((uintptr_t)pEug, 4096);
@@ -611,29 +755,62 @@ static bool InstallHooks(uintptr_t base) {
     WriteAbsJump64(relayEuh, (uintptr_t)&Hook_bs_euh);
     g_orig_bs_euh = (bs_lookup_t)trampEuh;
 
-    // Patch bs.eug (5 bytes)
-    DWORD oldProt = 0;
-    if (!VirtualProtect(pEug, 16, PAGE_EXECUTE_READWRITE, &oldProt)) {
+    // Save original bytes so a partial failure can be rolled back safely.
+    uint8_t origEug8[8];
+    uint8_t origEuh8[8];
+    memcpy(origEug8, pEug, 8);
+    memcpy(origEuh8, pEuh, 8);
+
+    // Build replacement bytes (eug: E9 rel32; euh: E9 rel32 + NOP).
+    uint8_t patchEug[8];
+    memcpy(patchEug, origEug8, 8);
+    int32_t relEug = (int32_t)((intptr_t)relayEug - ((intptr_t)pEug + 5));
+    patchEug[0] = 0xE9;
+    memcpy(patchEug + 1, &relEug, 4);
+
+    uint8_t patchEuh[8];
+    memcpy(patchEuh, origEuh8, 8);
+    int32_t relEuh = (int32_t)((intptr_t)relayEuh - ((intptr_t)pEuh + 5));
+    patchEuh[0] = 0xE9;
+    memcpy(patchEuh + 1, &relEuh, 4);
+    patchEuh[5] = 0x90;
+
+    // Apply a patch with all other threads suspended, so no thread can be
+    // executing a half-written instruction while the jump is installed.
+    auto applyPatch = [](uint8_t* target, const uint8_t* bytes) -> bool {
+        DWORD oldProt = 0;
+        if (!VirtualProtect(target, 16, PAGE_EXECUTE_READWRITE, &oldProt)) return false;
+        std::vector<HANDLE> suspended;
+        SuspendOtherThreads(suspended);
+        memcpy(target, bytes, 8);
+        FlushInstructionCache(GetCurrentProcess(), target, 16);
+        ResumeOtherThreads(suspended);
+        VirtualProtect(target, 16, oldProt, &oldProt);
+        return true;
+    };
+
+    if (!applyPatch(pEug, patchEug)) {
         LogMsg("ERROR: VirtualProtect failed on bs.eug");
         return false;
     }
-    int32_t relEug = (int32_t)((intptr_t)relayEug - ((intptr_t)pEug + 5));
-    pEug[0] = 0xE9;
-    *(int32_t*)(pEug + 1) = relEug;
-    VirtualProtect(pEug, 16, oldProt, &oldProt);
-    FlushInstructionCache(GetCurrentProcess(), pEug, 16);
-
-    // Patch bs.euh (6 bytes: E9 rel32 + 90 nop)
-    if (!VirtualProtect(pEuh, 16, PAGE_EXECUTE_READWRITE, &oldProt)) {
-        LogMsg("ERROR: VirtualProtect failed on bs.euh");
+    if (!applyPatch(pEuh, patchEuh)) {
+        LogMsg("ERROR: VirtualProtect failed on bs.euh; rolling back bs.eug");
+        DWORD oldProt = 0;
+        if (VirtualProtect(pEug, 16, PAGE_EXECUTE_READWRITE, &oldProt)) {
+            std::vector<HANDLE> suspended;
+            SuspendOtherThreads(suspended);
+            memcpy(pEug, origEug8, 8);
+            FlushInstructionCache(GetCurrentProcess(), pEug, 16);
+            ResumeOtherThreads(suspended);
+            VirtualProtect(pEug, 16, oldProt, &oldProt);
+        }
         return false;
     }
-    int32_t relEuh = (int32_t)((intptr_t)relayEuh - ((intptr_t)pEuh + 5));
-    pEuh[0] = 0xE9;
-    *(int32_t*)(pEuh + 1) = relEuh;
-    pEuh[5] = 0x90;
-    VirtualProtect(pEuh, 16, oldProt, &oldProt);
-    FlushInstructionCache(GetCurrentProcess(), pEuh, 16);
+
+    // Trampoline page no longer needs to be writable.
+    DWORD oldStubProt = 0;
+    VirtualProtect(stubPage, 4096, PAGE_EXECUTE_READ, &oldStubProt);
+    FlushInstructionCache(GetCurrentProcess(), stubPage, 4096);
 
     LogMsg("Successfully installed hooks! bs.eug=%p, bs.euh=%p, stubPage=%p", pEug, pEuh, stubPage);
     return true;
@@ -642,12 +819,24 @@ static bool InstallHooks(uintptr_t base) {
 // ============================================================================
 // 6. Worker Thread
 // ============================================================================
-static DWORD WINAPI ModWorkerThread(LPVOID) {
+static bool IsForegroundProcess() {
+    HWND hwnd = GetForegroundWindow();
+    if (!hwnd) return false;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    return pid == GetCurrentProcessId();
+}
+
+static DWORD ModWorkerThreadBody() {
     wchar_t exePath[MAX_PATH] = { 0 };
     GetModuleFileNameW(nullptr, exePath, MAX_PATH);
     std::wstring exeStr(exePath);
     size_t slash = exeStr.find_last_of(L"\\/");
     std::wstring gameDir = (slash != std::wstring::npos) ? exeStr.substr(0, slash) : L".";
+    std::wstring exeName = (slash != std::wstring::npos) ? exeStr.substr(slash + 1) : exeStr;
+    if (_wcsicmp(exeName.c_str(), L"UnityCrashHandler64.exe") == 0) {
+        return 0; // crash handler also imports VERSION.dll; do nothing here
+    }
     g_modDir = gameDir + L"\\JapaneseMod";
     CreateDirectoryW(g_modDir.c_str(), nullptr);
 
@@ -683,18 +872,21 @@ static DWORD WINAPI ModWorkerThread(LPVOID) {
     // F7 = Dump recent 128 IDs to JapaneseMod/recent_ids.txt
     bool prevF5 = false, prevF6 = false, prevF7 = false;
     while (true) {
-        bool curF5 = (GetAsyncKeyState(VK_F5) & 0x8000) != 0;
-        bool curF6 = (GetAsyncKeyState(VK_F6) & 0x8000) != 0;
-        bool curF7 = (GetAsyncKeyState(VK_F7) & 0x8000) != 0;
+        // Only react while the game window is in the foreground.
+        bool fg = IsForegroundProcess();
+        bool curF5 = fg && (GetAsyncKeyState(VK_F5) & 0x8000) != 0;
+        bool curF6 = fg && (GetAsyncKeyState(VK_F6) & 0x8000) != 0;
+        bool curF7 = fg && (GetAsyncKeyState(VK_F7) & 0x8000) != 0;
 
         if (curF5 && !prevF5) {
             ReloadTranslations();
             MessageBeep(MB_OK);
         }
         if (curF6 && !prevF6) {
-            g_modEnabled = !g_modEnabled;
-            LogMsg("Mod toggled: %s", g_modEnabled ? "ENABLED" : "DISABLED");
-            MessageBeep(g_modEnabled ? MB_OK : MB_ICONASTERISK);
+            bool nowEnabled = !g_modEnabled.load();
+            g_modEnabled.store(nowEnabled);
+            LogMsg("Mod toggled: %s", nowEnabled ? "ENABLED" : "DISABLED");
+            MessageBeep(nowEnabled ? MB_OK : MB_ICONASTERISK);
         }
         if (curF7 && !prevF7) {
             DumpRecentIds();
@@ -709,10 +901,35 @@ static DWORD WINAPI ModWorkerThread(LPVOID) {
     return 0;
 }
 
+static DWORD ModWorkerThreadInner() {
+    try {
+        return ModWorkerThreadBody();
+    }
+    catch (const std::exception& e) {
+        LogMsg("ERROR: exception in worker thread: %s", e.what());
+        return 1;
+    }
+    catch (...) {
+        LogMsg("ERROR: unknown exception in worker thread");
+        return 1;
+    }
+}
+
+static DWORD WINAPI ModWorkerThread(LPVOID) {
+    __try {
+        return ModWorkerThreadInner();
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        LogMsg("ERROR: SEH exception in worker thread (0x%08X)", (unsigned)GetExceptionCode());
+        return 1;
+    }
+}
+
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID) {
     if (ul_reason_for_call == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);
-        InitVersionProxy();
+        // NOTE: the system version.dll is resolved lazily inside the proxy
+        // functions (InitOnce), not here, to avoid LoadLibrary under the loader lock.
         HANDLE hThread = CreateThread(nullptr, 0, ModWorkerThread, nullptr, 0, nullptr);
         if (hThread) CloseHandle(hThread);
     }
