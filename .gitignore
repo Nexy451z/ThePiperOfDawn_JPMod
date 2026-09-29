@@ -1,0 +1,25 @@
+# ゲーム原文の抽出データ（再配布回避のため非公開）
+extracted/
+extracted_v2/
+batches/
+
+# 作業レポート（開発メモ）
+reports/
+
+# Python
+__pycache__/
+*.pyc
+
+# C++ build artifacts
+*.obj
+*.exp
+*.lib
+*.ilk
+*.pdb
+*.o
+
+# OS / editor
+Thumbs.db
+.DS_Store
+*.log
+recent_ids.txt
