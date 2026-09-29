@@ -5,7 +5,7 @@
 
 - UI・アイテム・システム翻訳: **Language.json（6,459件）**
 - ストーリー・会話翻訳: **LanguageTalk.json（41,159件）**
-- 翻訳方針は中国語原文（cn）を基準に、用語集とキャラ別口調定義（`TRANSLATION_BIBLE.md`）で統一
+- 公開ファイルは**翻訳文のみ**です（ゲームの原文テキストは含みません）
 
 ## 特徴
 
@@ -52,18 +52,14 @@ JapaneseMod\LanguageTalk.json
 dist/
   version.dll                   ビルド済みプロキシDLL
   JapaneseMod/
-    Language.json               UI・アイテム・システム翻訳
-    LanguageTalk.json           ストーリー・会話翻訳
+    Language.json                UI・アイテム・システム翻訳（id と jp のみ）
+    LanguageTalk.json            ストーリー・会話翻訳（id と jp のみ）
   ThePiperOfDawn_JPMod_v1.0.zip 配布用パッケージ
   README.txt                    同梱インストール説明
 mod_src/
   version.cpp                   Proxy DLL 本体（C++ / Win32）
   version.def                   エクスポート定義
   build.bat                     ビルド用バッチ（MSVC）
-tools/
-  *.py                          翻訳抽出・マージ・QA・用語統一スクリプト
-glossary.json                   固有名詞・用語集
-TRANSLATION_BIBLE.md            翻訳バイブル（世界観・口調定義）
 ```
 
 ## ビルド方法（DLLの再ビルド）
@@ -73,12 +69,12 @@ TRANSLATION_BIBLE.md            翻訳バイブル（世界観・口調定義）
 
 ## 翻訳について
 
-- 原文は中国語（cn）のみを参照し、既存の機械翻訳や英語訳の誤りは引き継いでいません
-- 地名・陣営・キャラクター名などの固有名詞は `glossary.json` で統一
-- 話者ID（flag）ごとに一人称・二人称・文末表現を `TRANSLATION_BIBLE.md` で固定
+- 中国語原文を基準に翻訳し、既存の機械翻訳の誤りは引き継いでいません
+- 地名・陣営・キャラクター名などの固有名詞と、話者ごとの一人称・二人称・文末表現を統一しています
+- 翻訳JSONは `[{"id": 数値, "jp": "訳文"}]` 形式で、ゲーム本体の更新時は該当IDのみ再生成してください
 
 ## 免責
 
 - 本MODは非公式のファン翻訳であり、ゲームの開発元・販売元とは一切関係ありません
-- ゲーム本体のファイルおよび著作権は各権利者に帰属します。本リポジトリにはゲーム本体のファイルは含まれません
+- ゲーム本体のファイルおよび著作権は各権利者に帰属します。本リポジトリにはゲーム本体のファイルおよび原文テキストは含まれません
 - 本MODの利用は自己責任でお願いします

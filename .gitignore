@@ -6,6 +6,14 @@ batches/
 # 作業レポート（開発メモ）
 reports/
 
+# 開発用ツール・資料（公開しない）
+tools/
+TRANSLATION_BIBLE.md
+glossary.json
+
+# ローカル保管の完全版翻訳データ（cn/tw/en を含む／公開しない）
+source_full/
+
 # Python
 __pycache__/
 *.pyc
