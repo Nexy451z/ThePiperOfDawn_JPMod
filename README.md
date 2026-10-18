@@ -23,7 +23,7 @@ JapaneseMod\Language.json
 JapaneseMod\LanguageTalk.json
 ```
 
-または `dist/ThePiperOfDawn_JPMod_v1.0.zip` を解答してゲームフォルダへコピーします。
+または `dist/ThePiperOfDawn_JPMod_v1.0.1.zip` を解答してゲームフォルダへコピーします。
 
 ## ゲーム内ショートカット
 
@@ -54,7 +54,7 @@ dist/
   JapaneseMod/
     Language.json                UI・アイテム・システム翻訳（id と jp のみ）
     LanguageTalk.json            ストーリー・会話翻訳（id と jp のみ）
-  ThePiperOfDawn_JPMod_v1.0.zip 配布用パッケージ
+  ThePiperOfDawn_JPMod_v1.0.1.zip 配布用パッケージ
   README.txt                    同梱インストール説明
 mod_src/
   version.cpp                   Proxy DLL 本体（C++ / Win32）
