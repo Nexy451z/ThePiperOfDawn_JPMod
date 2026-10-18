@@ -525,7 +525,7 @@ static void DumpRecentIds() {
 }
 
 // ============================================================================
-// 5. IL2CPP Hooks (bs.eug @ RVA 0x3D2D20 & bs.euh @ RVA 0x3D2E40)
+// 5. IL2CPP Hooks (bs.eug & bs.euh; RVAs below are build-specific defaults)
 // ============================================================================
 using il2cpp_string_new_t = void* (*)(const char* str);
 using bs_lookup_t = void* (*)(int32_t id, const void* method);
@@ -544,7 +544,11 @@ static gchandle_get_target_t g_gchandle_get_target = nullptr;
 static std::atomic<bool> g_strCacheAvailable{ false };
 
 // Check if in-game language is set to Japanese (1)
-// In bs.eug/bs.euh: call 0x519E20 -> [rax + 0xC0] == 1 for Japanese (0=CN, 1=JP, 2=TW, 3=EN)
+// In bs.eug/bs.euh the settings getter is called and the result is read at
+// [rax + langFieldOffset] (0=CN, 1=JP, 2=TW, 3=EN). The field moves when the
+// game adds data to the setting manager, so InstallHooks re-derives the offset
+// from the hooked code on every launch; 0xC0 is only a last-resort default.
+static std::atomic<int32_t> g_langFieldOffset{ 0xC0 };
 static std::atomic<int64_t> g_langCheckTick{ 0 };
 static std::atomic<int> g_langCheckResult{ 1 };
 
@@ -560,7 +564,7 @@ static bool IsGameLanguageJapanese() {
     bool jp = true;
     __try {
         uintptr_t mgr = g_get_setting_mgr(nullptr);
-        if (mgr) jp = (*(int32_t*)(mgr + 0xC0) == 1);
+        if (mgr) jp = (*(int32_t*)(mgr + (size_t)g_langFieldOffset.load()) == 1);
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
         jp = true; // fail open: keep translation visible
@@ -720,7 +724,9 @@ static size_t GetImageSize(uintptr_t base) {
     return nt->OptionalHeader.SizeOfImage;
 }
 
-static void FindPatternAll(uintptr_t base, const uint8_t* pat, size_t patLen,
+// mask == nullptr performs an exact match; otherwise only the bits set in mask[i]
+// are compared (0xFF = exact byte, 0x00 = wildcard).
+static void FindPatternAll(uintptr_t base, const uint8_t* pat, const uint8_t* mask, size_t patLen,
                            std::vector<uint8_t*>& out, size_t maxHits = 64) {
     out.clear();
     auto* dos = (IMAGE_DOS_HEADER*)base;
@@ -734,7 +740,16 @@ static void FindPatternAll(uintptr_t base, const uint8_t* pat, size_t patLen,
         size_t sz = sec->Misc.VirtualSize;
         if (sz < patLen) continue;
         for (size_t off = 0; off <= sz - patLen; ++off) {
-            if (memcmp(start + off, pat, patLen) == 0) {
+            bool hit = false;
+            if (mask) {
+                hit = true;
+                for (size_t k = 0; k < patLen; ++k) {
+                    if ((start[off + k] ^ pat[k]) & mask[k]) { hit = false; break; }
+                }
+            } else {
+                hit = memcmp(start + off, pat, patLen) == 0;
+            }
+            if (hit) {
                 out.push_back(start + off);
                 if (out.size() >= maxHits) return;
             }
@@ -743,8 +758,10 @@ static void FindPatternAll(uintptr_t base, const uint8_t* pat, size_t patLen,
 }
 
 static bool InstallHooks(uintptr_t base) {
-    // RVA 0x3D2D20: bs.eug (first 5 bytes: 48 89 5C 24 08 = mov [rsp+8], rbx)
-    // RVA 0x3D2E40: bs.euh (first 6 bytes: 40 53 48 83 EC 20 = push rbx; sub rsp, 20h)
+    // Known-good RVAs on build 25800071 (2026-10-10): bs.eug 0x3D3D20,
+    // bs.euh 0x3D3E40 (bs.euh is always 0x120 after bs.eug).
+    // bs.eug: 48 89 5C 24 08 = mov [rsp+8], rbx
+    // bs.euh: 40 53 48 83 EC 20 = push rbx; sub rsp, 20h
     size_t imgSize = GetImageSize(base);
     if (imgSize == 0) {
         LogMsg("ERROR: Failed to read GameAssembly.dll PE headers");
@@ -759,12 +776,25 @@ static bool InstallHooks(uintptr_t base) {
     const uint8_t expectedEuh[6] = { 0x40, 0x53, 0x48, 0x83, 0xEC, 0x20 };
 
     // Pattern-scan first so the mod keeps working when a game update shifts code.
-    // The signature is a unique switch tail inside bs.euh, at +0xAB from its entry.
+    // The signature is a unique switch tail inside bs.euh, at +0xAB from its entry:
+    //   8B 90 <disp32>   mov edx, [rax + langFieldOffset]
+    //   85 D2            test edx, edx
+    //   74 2D            je ...
+    //   83 EA 01 74 1E   language 1
+    //   83 EA 01 74 0F   language 2
+    // The displacement is wildcarded: the language field moved (0xC0 -> 0xD4) in
+    // the 2026-10-10 build and may move again.
     const uint8_t euhTailSig[] = {
-        0x8B, 0x90, 0xC0, 0x00, 0x00, 0x00,
+        0x8B, 0x90, 0x00, 0x00, 0x00, 0x00,
         0x85, 0xD2, 0x74, 0x2D,
         0x83, 0xEA, 0x01, 0x74, 0x1E,
         0x83, 0xEA, 0x01, 0x74, 0x0F
+    };
+    const uint8_t euhTailMask[] = {
+        0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00,
+        0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF
     };
 
     uint8_t* pEug = nullptr;
@@ -772,7 +802,7 @@ static bool InstallHooks(uintptr_t base) {
     bool resolved = false;
 
     std::vector<uint8_t*> hits;
-    FindPatternAll(base, euhTailSig, sizeof(euhTailSig), hits);
+    FindPatternAll(base, euhTailSig, euhTailMask, sizeof(euhTailSig), hits);
     std::vector<std::pair<uint8_t*, uint8_t*>> candidates;
     for (uint8_t* tail : hits) {
         if ((uintptr_t)tail < base + 0xAB + 0x120) continue;
@@ -800,9 +830,9 @@ static bool InstallHooks(uintptr_t base) {
     }
 
     if (!resolved) {
-        // Fall back to the last known RVAs (validated before use).
-        pEug = (uint8_t*)(base + 0x3D2D20);
-        pEuh = (uint8_t*)(base + 0x3D2E40);
+        // Fall back to the RVAs of build 25800071 (validated before use).
+        pEug = (uint8_t*)(base + 0x3D3D20);
+        pEuh = (uint8_t*)(base + 0x3D3E40);
         if (!inImage(pEug, 32) || !inImage(pEuh, 32)) {
             LogMsg("ERROR: Hook target RVAs are outside the GameAssembly.dll image");
             return false;
@@ -818,6 +848,23 @@ static bool InstallHooks(uintptr_t base) {
             return false;
         }
         LogMsg("Pattern scan inconclusive; using known RVAs");
+    }
+
+    // Recover the language field offset from the switch tail we just located
+    // (8B 90 <disp32> at +0xAB). The game itself reads the same field, so this
+    // keeps language detection correct even when the setting manager grows.
+    if (inImage(pEuh + 0xAB, 6) && pEuh[0xAB] == 0x8B && pEuh[0xAC] == 0x90) {
+        int32_t langDisp = *(int32_t*)(pEuh + 0xAD);
+        if (langDisp > 0 && langDisp < 0x10000) {
+            g_langFieldOffset.store(langDisp);
+            LogMsg("Language field offset: +0x%X", (unsigned)langDisp);
+        } else {
+            LogMsg("WARN: implausible language field offset 0x%X; keeping +0x%X",
+                (unsigned)langDisp, (unsigned)g_langFieldOffset.load());
+        }
+    } else {
+        LogMsg("WARN: language switch tail not found; keeping +0x%X",
+            (unsigned)g_langFieldOffset.load());
     }
 
     // Dynamically resolve get_setting_mgr from the call instruction at pEuh + 0xA1
