@@ -23,7 +23,7 @@ JapaneseMod\Language.json
 JapaneseMod\LanguageTalk.json
 ```
 
-または `dist/ThePiperOfDawn_JPMod_v1.0.1.zip` を解答してゲームフォルダへコピーします。
+または `dist/ThePiperOfDawn_JPMod_v1.0.2.zip` を解答してゲームフォルダへコピーします。
 
 ## ゲーム内ショートカット
 
@@ -54,7 +54,7 @@ dist/
   JapaneseMod/
     Language.json                UI・アイテム・システム翻訳（id と jp のみ）
     LanguageTalk.json            ストーリー・会話翻訳（id と jp のみ）
-  ThePiperOfDawn_JPMod_v1.0.1.zip 配布用パッケージ
+  ThePiperOfDawn_JPMod_v1.0.2.zip 配布用パッケージ
   README.txt                    同梱インストール説明
 mod_src/
   version.cpp                   Proxy DLL 本体（C++ / Win32）
@@ -73,6 +73,12 @@ Visual Studio（「C++によるデスクトップ開発」または Build Tools�
 - 中国語原文を基準に翻訳し、既存の機械翻訳の誤りは引き継いでいません
 - 地名・陣営・キャラクター名などの固有名詞と、話者ごとの一人称・二人称・文末表現を統一しています
 - 翻訳JSONは `[{"id": 数値, "jp": "訳文"}]` 形式で、ゲーム本体の更新時は該当IDのみ再生成してください
+
+## 更新履歴
+
+- **v1.0.2**（2026-10-20）: ゲーム Ver.1.0.12 対応。新規UI・スキル名50件の訳を追加、原文が変更された14件の訳を修正、ゲーム側で削除された会話1,258件を除去
+- **v1.0.1**（2026-10-18）: ゲームアップデート（2026-10-10 / build 25800071）対応。フック位置の再特定・言語オフセットの自動取得・シグネチャのワイルドカード化
+- **v1.0**（2026-09-29）: 初回リリース
 
 ## 免責
 
